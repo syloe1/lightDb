@@ -1,0 +1,226 @@
+#include "lightdb/logger.h"
+#include "lightdb/plan.h"
+#include "lightdb/planner.h"
+#include "lightdb/heap_file.h"
+#include "lightdb/buffer_pool.h"
+#include "lightdb/catalog.h"
+#include "lightdb/base.h"
+#include "lightdb/bplus_tree.h"
+// 新增头文件引用，解决编译错误
+#include "lightdb/lexer.h"
+#include "lightdb/parser.h"
+
+#include <cassert>
+#include <iostream>
+
+// 测试 Parser 函数
+void TestParser(const std::string& sql) {
+    LOG_INFO("Parsing SQL: " + sql);
+    try {
+        lightdb::Lexer lexer(sql);
+        auto tokens = lexer.Tokenize();
+        
+        lightdb::Parser parser(tokens);
+        auto stmt = parser.ParseSQL();
+        
+        if (stmt) {
+            std::string type_str;
+            switch(stmt->type) {
+                case lightdb::StatementType::SELECT: type_str = "SELECT"; break;
+                case lightdb::StatementType::INSERT: type_str = "INSERT"; break;
+                case lightdb::StatementType::CREATE_TABLE: type_str = "CREATE TABLE"; break;
+                case lightdb::StatementType::DELETE: type_str = "DELETE"; break;
+                case lightdb::StatementType::UPDATE: type_str = "UPDATE"; break;
+            }
+            LOG_INFO("Success! AST Type: " + type_str);
+            
+            // 简单打印部分信息验证
+            if (stmt->type == lightdb::StatementType::SELECT) {
+                auto s = static_cast<lightdb::SelectStatement*>(stmt.get());
+                LOG_INFO("Table: " + s->table_name);
+                if (!s->where_clauses.empty()) {
+                    LOG_INFO("Where: " + s->where_clauses[0].column + " " + s->where_clauses[0].op + " " + s->where_clauses[0].value.value);
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR(e.what());
+    }
+    std::cout << "-----------------------------------" << std::endl;
+}
+
+// 测试 Planner 函数
+void TestPlanner(lightdb::Planner& planner, const std::string& sql) {
+    LOG_INFO(">>> Planning SQL: " + sql);
+    try {
+        lightdb::Lexer lexer(sql);
+        auto tokens = lexer.Tokenize();
+        
+        lightdb::Parser parser(tokens);
+        // 使用 ParseSQL 而不是 ParseStatement 来获取顶层 Statement
+        auto stmt = parser.ParseSQL(); 
+        
+        auto plan = planner.PlanQuery(stmt.get());
+        
+        if (plan) {
+            std::string plan_type;
+            switch(plan->type) {
+                case lightdb::PlanType::SEQ_SCAN: 
+                    plan_type = "Physical Plan: SeqScan (Full Table Scan)"; 
+                    break;
+                case lightdb::PlanType::INDEX_SCAN: 
+                    plan_type = "Physical Plan: IndexScan (B+ Tree Lookup)"; 
+                    {
+                        // 打印 IndexScan 的具体信息
+                        auto idx_plan = static_cast<lightdb::IndexScanPlan*>(plan.get());
+                        // 假设 Value 是 int 类型，用于打印
+                        if (idx_plan->value.type == lightdb::Value::INT) {
+                            plan_type += " [Index: " + idx_plan->index_name + " on " + idx_plan->column_name + 
+                                        ", Condition: " + idx_plan->op + " " + idx_plan->value.value + "]";
+                        } else {
+                            plan_type += " [Index: " + idx_plan->index_name + " on " + idx_plan->column_name + 
+                                        ", Condition: " + idx_plan->op + " '" + idx_plan->value.value + "']";
+                        }
+                    }
+                    break;
+                case lightdb::PlanType::INSERT: plan_type = "Physical Plan: Insert"; break;
+                case lightdb::PlanType::CREATE_TABLE: plan_type = "Physical Plan: CreateTable"; break;
+                default: plan_type = "Physical Plan: Other"; break;
+            }
+            LOG_INFO(plan_type);
+        } else {
+            LOG_ERROR("Plan generation failed.");
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("Parsing/Planning Error: " + std::string(e.what()));
+    }
+    std::cout << "-----------------------------------" << std::endl;
+}
+int main() {
+    // 初始化日志
+    lightdb::Logger::GetInstance().SetLogLevel(lightdb::LogLevel::DEBUG);
+    LOG_INFO("LightDB 基础框架启动成功！");
+    LOG_DEBUG("当前 C++ 标准：C++17");
+
+    // 测试基础类型
+    lightdb::RID rid(1, 0);
+    LOG_INFO("测试 RID：" + rid.ToString());
+
+    lightdb::Tuple tuple;
+    tuple.AddField("1");
+    tuple.AddField("Alice");
+    LOG_INFO("测试 Tuple：id=" + tuple.GetField(0) + ", name=" + tuple.GetField(1));
+
+    LOG_INFO("Stage 1 仓库初始化与基础框架搭建完成！");
+
+    // 测试HeapFile
+    lightdb::BufferPool buffer_pool(1024);  // 增大缓冲池
+    lightdb::HeapFile heap_file("test_table.db", &buffer_pool);
+    for(int i = 0; i < 100; i++) {
+        lightdb::Record record;
+        record.data = "user_" + std::to_string(i) + ", page_" + std::to_string(20 + i % 10);
+        heap_file.InsertRecord(record);
+    }
+    LOG_INFO("Insert 100 records to HeapFile successfully");
+    std::vector<lightdb::Record> records = heap_file.SeqScan();
+    LOG_INFO("SeqScan result: total " + std::to_string(records.size()) + " records");
+
+    // 新增B+Tree测试
+    lightdb::BTreeIndex btree(&buffer_pool, 200);  // 阶数200
+    std::vector<lightdb::RID> test_rids;
+
+    // 插入1万条数据
+    for (int i = 0; i < 10000; ++i) {
+        lightdb::RID test_rid(0, i);  // 模拟HeapFile中的RID
+        btree.Insert(i, test_rid);
+        test_rids.push_back(test_rid);
+    }
+    LOG_INFO("Insert 10000 records to B+Tree successfully");
+
+    // 测试查找
+    lightdb::RID found_rid;
+    assert(btree.Search(5000, found_rid) && found_rid == test_rids[5000]);
+    LOG_INFO("B+Tree Search test passed");
+
+    // 测试范围扫描
+    auto range_result = btree.RangeScan(1000, 2000);
+    assert(range_result.size() == 1001);  // 包含1000到2000共1001个值
+    LOG_INFO("B+Tree RangeScan test passed");
+
+    // 测试删除
+    assert(btree.Delete(5000));
+    assert(!btree.Search(5000, found_rid));
+    LOG_INFO("B+Tree Delete test passed");
+
+    // 扩展测试10万数据
+    for (int i = 10000; i < 100000; ++i) {
+        lightdb::RID test_rid(0, i);
+        btree.Insert(i, test_rid);
+    }
+    assert(btree.Search(99999, found_rid) && found_rid.slot_id == 99999);
+    LOG_INFO("B+Tree 100000 records test passed");
+
+    LOG_INFO("Storage Engine Stage Test completed");
+
+    // --- Parser 测试部分 ---
+    lightdb::Logger::GetInstance().SetLogLevel(lightdb::LogLevel::INFO);
+
+    // 1. Create Table
+    TestParser("CREATE TABLE users (id INT, name VARCHAR(50));");
+
+    // 2. Insert
+    TestParser("INSERT INTO users VALUES (1, 'Alice');");
+
+    // 3. Select
+    TestParser("SELECT * FROM users WHERE id = 1;");
+    
+    // 4. Update
+    TestParser("UPDATE users SET name = 'Bob' WHERE id = 1;");
+
+    // 5. Syntax Error Test
+    TestParser("SELECT * FROM ;"); // 缺少表名
+    lightdb::Logger::GetInstance().SetLogLevel(lightdb::LogLevel::INFO);
+    LOG_INFO("Starting Stage 5: Query Planner & Optimizer Test");
+
+    // 1. 基础设施初始化
+    lightdb::BufferPool planner_buffer_pool(1024);
+    
+    // 2. 模拟系统目录 (Catalog)
+    lightdb::Catalog catalog;
+    
+    // 模拟表 "users"
+    lightdb::HeapFile user_heap("users.db", &buffer_pool);
+    catalog.RegisterTable("users", &user_heap);
+    
+    // 模拟表 "orders"
+    lightdb::HeapFile order_heap("orders.db", &buffer_pool);
+    catalog.RegisterTable("orders", &order_heap);
+
+    // *** 关键：只在 users 表的 id 字段上注册索引 ***
+    lightdb::BTreeIndex user_id_index(&buffer_pool);
+    catalog.RegisterIndex("users", "id", &user_id_index);
+    LOG_INFO("System Catalog Initialized: Index 'idx_users_id' created on users(id)");
+
+    // 3. 初始化 Planner
+    lightdb::Planner planner(&catalog);
+
+    // --- 测试用例 1: SELECT - 使用了索引列查询 (预期: IndexScan) ---
+    TestPlanner(planner, "SELECT * FROM users WHERE id = 100;");
+
+    // --- 测试用例 2: SELECT - 使用了非索引列查询 (预期: SeqScan) ---
+    TestPlanner(planner, "SELECT * FROM users WHERE name = 'Alice';");
+
+    // --- 测试用例 3: SELECT - 复杂查询，但包含索引条件 (预期: IndexScan) ---
+    // 简单的优化器规则是只要找到一个索引条件就返回 IndexScan。
+    TestPlanner(planner, "SELECT * FROM users WHERE id = 5 AND name = 'Alice';");
+
+    // --- 测试用例 4: SELECT - 其他表查询 (预期: SeqScan) ---
+    TestPlanner(planner, "SELECT * FROM orders WHERE id = 1;");
+    
+    // --- 测试用例 5: INSERT (预期: InsertPlan) ---
+    TestPlanner(planner, "INSERT INTO users VALUES (10, 'Bob');");
+
+    // --- 测试用例 6: CREATE TABLE (预期: CreateTablePlan) ---
+    TestPlanner(planner, "CREATE TABLE posts (id INT, title VARCHAR);");
+    return 0;
+}
